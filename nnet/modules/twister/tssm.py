@@ -46,6 +46,9 @@ class TSSM(nn.Module):
             drop_rate=0.1,
             att_context_left=64,
             module_pre_norm=False,
+            att_query_chunk_size=None,
+            max_pos_encoding=2048,
+            imag_start_chunk_size=None,
         ):
         super(TSSM, self).__init__()
 
@@ -70,7 +73,8 @@ class TSSM(nn.Module):
         self.num_heads = num_heads
         self.drop_rate = drop_rate
         self.att_context_left = att_context_left
-        self.max_pos_encoding = 2048
+        self.max_pos_encoding = max_pos_encoding
+        self.imag_start_chunk_size = imag_start_chunk_size
 
         # zt + at -> Linear -> Norm -> Act -> Linear -> Norm -> et
         self.action_mixer = modules.MultiLayerPerceptron(
@@ -95,7 +99,8 @@ class TSSM(nn.Module):
                     "bias_init": "default", 
                     "attn_drop_rate": self.drop_rate, 
                     "max_pos_encoding": self.max_pos_encoding, 
-                    "causal": True
+                    "causal": True,
+                    "query_chunk_size": att_query_chunk_size
                 }
             },
             emb_drop_rate=0.0,
@@ -173,6 +178,83 @@ class TSSM(nn.Module):
 
         return posts, priors
 
+    def imagination_start(self, posts, is_firsts, shared_kv=False):
+
+        """Flatten observe posts (B, L, ...) into B*L imagination start states
+
+        Args:
+            posts: observe posts with hidden list of (K, V) of shape (B, L, D) (observe with prev_state=None)
+            is_firsts: (B, L)
+            shared_kv: share the observe keys / values between start points (SharedKVCache)
+                instead of copying a (B*L, C, D) window per start point
+
+        Return:
+            prev_state: dict of (B*L, 1, ...) states, hidden
+            is_firsts: (B*L, 1) or None with shared_kv
+            is_firsts_hidden: (B*L, C) or None with shared_kv
+        """
+
+        L = is_firsts.shape[1]
+        C = self.att_context_left
+
+        # Shared KV: one (B, H, L, d) cache per block, masks built in attention
+        if shared_kv:
+            hidden = modules.build_shared_kv_caches(posts["hidden"], is_firsts, num_heads=self.num_heads, context=C, start_chunk_size=self.imag_start_chunk_size)
+            prev_state = {k: hidden if k == "hidden" else v.flatten(start_dim=0, end_dim=1).unsqueeze(dim=1).detach() for k, v in posts.items()}
+            return prev_state, None, None
+
+        # Original TWISTER implementation
+        # K, V: (B, C+L, D) -> (B*L, C, D)
+        hidden_flatten = [
+            (
+                # Key (B*L, C, D)
+                torch.stack([
+
+                    # Padd hidden if not enough left context (B, C, D)
+                    torch.cat([
+                        # Zero Padding to reach length (C,): max(0, L+C-1-t - len(h))
+                        hidden_blk[0].new_zeros(hidden_blk[0].shape[0], max(0, L+C-1-t - hidden_blk[0].shape[1]), hidden_blk[0].shape[2]),
+                        # hidden [-L+t+1 - C:-L+t+1]
+                        hidden_blk[0][:, max(0, hidden_blk[0].shape[1]-L+t+1 - C):hidden_blk[0].shape[1]-L+t+1]
+                    ], dim=1)
+
+                for t in range(0, L)], dim=1).flatten(start_dim=0, end_dim=1).detach(), # (B, L, C, D) -> (B*L, C, D)
+
+                # Value (B*L, C, D)
+                torch.stack([
+
+                    # Padd hidden if not enough left context (B, C, D)
+                    torch.cat([
+                        # zeros max(0, L+C-1-t - len(h))
+                        hidden_blk[1].new_zeros(hidden_blk[1].shape[0], max(0, L+C-1-t - hidden_blk[1].shape[1]), hidden_blk[1].shape[2]),
+                        # hidden [-L+t+1 - C:-L+t+1]
+                        hidden_blk[1][:, max(0, hidden_blk[1].shape[1]-L+t+1 - C):hidden_blk[1].shape[1]-L+t+1]
+                    ], dim=1)
+
+                for t in range(0, L)], dim=1).flatten(start_dim=0, end_dim=1).detach(), # (B, L, C, D) -> (B*L, C, D)
+            )
+        for hidden_blk in posts["hidden"]]
+
+        # is_firsts flatten (B, L) -> (B*L, 1), will result in masking hidden if true
+        is_firsts_flatten = is_firsts.flatten(start_dim=0, end_dim=1).unsqueeze(dim=1).detach()
+
+        # is_firsts hidden flatten (B, C+L) -> (B*L, C)
+        is_firsts_hidden = torch.stack([
+            torch.cat([
+                # Zero Padding to reach length (C,): max(0, L+C-1-t - len(h))
+                is_firsts.new_zeros(is_firsts.shape[0], max(0, L+C-1-t - is_firsts.shape[1])),
+                # set first element to True in order to mask padding (1,)
+                is_firsts.new_ones(is_firsts.shape[0], 1),
+                # is_firsts [t-C + 1:t]
+                is_firsts[:, max(0, is_firsts.shape[1]-L+t+1-C):is_firsts.shape[1]-L+t]
+            ], dim=1)
+        for t in range(0, L)], dim=1).flatten(start_dim=0, end_dim=1).detach()
+
+        # Flatten and detach post (B, L, D) -> (B*L, 1, D) = (B', 1, D)
+        prev_state = {k: hidden_flatten if k == "hidden" else v.flatten(start_dim=0, end_dim=1).unsqueeze(dim=1).detach() for k, v in posts.items()}
+
+        return prev_state, is_firsts_flatten, is_firsts_hidden
+
     def imagine(self, p_net, prev_state, img_steps=1, is_firsts=None, is_firsts_hidden=None, actions=None):
 
         # Policy
@@ -189,16 +271,21 @@ class TSSM(nn.Module):
         img_states = {"stoch": [prev_state["stoch"]], "deter": [prev_state["deter"]], "logits": [prev_state["logits"]], "action": [prev_state["action"]]}
         for h in range(img_steps):
 
+            # Shared KV cache: band / episode masks are built inside the attention layers
+            if modules.is_shared_kv_hidden(prev_state["hidden"]):
+                mask = None
+
             # Compute mask
-            mask = modules.return_mask(
-                seq_len=1, 
-                hidden_len=self.get_hidden_len(prev_state["hidden"]), 
-                left_context=self.att_context_left, 
-                right_context=0, 
-                dtype=prev_state["action"].dtype, 
-                device=prev_state["action"].device
-            )
-            if is_firsts_hidden is not None:
+            else:
+                mask = modules.return_mask(
+                    seq_len=1, 
+                    hidden_len=self.get_hidden_len(prev_state["hidden"]), 
+                    left_context=self.att_context_left, 
+                    right_context=0, 
+                    dtype=prev_state["action"].dtype, 
+                    device=prev_state["action"].device
+                )
+            if is_firsts_hidden is not None and mask is not None:
 
                 # Append is_first mask
                 is_firts_mask = modules.return_is_firsts_mask(is_firsts=is_firsts, is_firsts_hidden=is_firsts_hidden)
@@ -249,13 +336,19 @@ class TSSM(nn.Module):
 
     def slice_hidden(self, hidden):
 
+        # SharedKVCache keeps only the last C imagined tokens itself
+        if modules.is_shared_kv_hidden(hidden):
+            return hidden
+
         hidden = [(hidden_blk[0][:, -self.att_context_left:], hidden_blk[1][:, -self.att_context_left:]) for hidden_blk in hidden]
 
         return hidden
     
     def get_hidden_len(self, hidden):
 
-        if hidden != None:
+        if modules.is_shared_kv_hidden(hidden):
+            return 0
+        elif hidden != None:
             return hidden[0][0].shape[1]
         else:
             return 0

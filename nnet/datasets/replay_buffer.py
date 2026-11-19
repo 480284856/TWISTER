@@ -64,6 +64,9 @@ class ReplayBuffer(datasets.Dataset):
             "num_steps": self.num_steps
         }
 
+    def can_sample(self):
+        return len(self.ram_buffer) > 0
+
     def state_dict(self):
         return { 
             "traj_index": self.traj_index,

@@ -15,3 +15,4 @@
 from .batch_env import BatchEnv
 from .time_limit import TimeLimit
 from .reset_on_exception import ResetOnException
+from .parallel_batch_env import ParallelBatchEnv, make_env

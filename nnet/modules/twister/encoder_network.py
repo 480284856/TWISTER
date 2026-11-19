@@ -19,6 +19,7 @@ import torch.nn as nn
 # NeuralNets
 from nnet import modules
 from nnet import distributions
+from nnet.modules.twister.chunked import chunked_checkpoint
 
 class EncoderNetwork(nn.Module):
 
@@ -36,8 +37,12 @@ class EncoderNetwork(nn.Module):
         dist_weight_init="xavier_uniform", 
         dist_bias_init="zeros",
         uniform_mix=0.01,
+        checkpoint_chunk_size=None,
     ):
         super(EncoderNetwork, self).__init__()
+
+        # CNN computed by chunks of frames with activation checkpointing (None = all frames at once)
+        self.checkpoint_chunk_size = checkpoint_chunk_size
 
         # Params
         self.dim_input_cnn = dim_input_cnn
@@ -83,7 +88,7 @@ class EncoderNetwork(nn.Module):
         x = x.reshape((-1,) + shape[-3:])
 
         # (N, C, 64, 64) -> (N, C, 4, 4)
-        x = self.cnn(x)
+        x = chunked_checkpoint(self.cnn, x, self.checkpoint_chunk_size)
 
         # (N, C, 4, 4) -> (B, L, 4*4 * C) / (N, C, 4, 4) -> (N, 4*4 * C)
         x = x.reshape(shape[:-3] + (4*4 * 8*self.dim_cnn,))

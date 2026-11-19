@@ -15,6 +15,7 @@
 from .multi_head_attention import MultiHeadAttention
 from .rel_pos_multi_head_self_attention import RelPosMultiHeadSelfAttention
 from .attention_mask import return_mask, return_padding_mask, return_is_firsts_mask
+from .shared_kv_cache import SharedKVCache, build_shared_kv_caches, episode_start_from_is_firsts, is_shared_kv_hidden
 
 # Attentions Dictionary
 att_dict = {

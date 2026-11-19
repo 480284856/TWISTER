@@ -22,13 +22,28 @@ from nnet import models
 from nnet import optimizers
 from nnet import envs
 from nnet.modules import twister as twister_networks
+from nnet.modules.twister import chunked as twister_chunked
 from nnet.structs import AttrDict
 
 # Other
 import copy
+import functools
 import itertools
 import os
 import glob
+
+def num_env_steps_to_run(balance, num_env_steps):
+
+    """Number of env_step calls for this model step and the remaining balance
+
+    The fractional part of num_env_steps is accumulated across model steps,
+    so the average number of env_step calls per model step is exactly num_env_steps.
+    """
+
+    balance = balance + num_env_steps
+    n = int(balance + 1e-9)
+
+    return n, balance - n
 
 class TWISTER(models.Model):
 
@@ -50,12 +65,26 @@ class TWISTER(models.Model):
                 "num_heads_trans": 8,
                 "drop_rate_trans": 0.1
             }),
+            # Memory Maze (TT-MBRL, Table 15b)
+            "MM": AttrDict({
+                "dim_cnn": 48,
+                "hidden_size": 640,
+                "num_layers": 3,
+
+                "stoch_size": 32,
+                "discrete": 32,
+
+                "num_blocks_trans": 5,
+                "ff_ratio_trans": 3,
+                "num_heads_trans": 10,
+                "drop_rate_trans": 0.1
+            }),
         }
 
         # Env Type
         env_name = env_name.split("-")
         self.env_type = env_name[0]
-        assert self.env_type in ["dmc", "atari100k"]
+        assert self.env_type in ["dmc", "atari100k", "memory_maze"]
 
         # Config
         self.config = AttrDict()
@@ -75,6 +104,17 @@ class TWISTER(models.Model):
             self.config.model_size = "S"
             self.config.time_limit = 108000
             self.config.time_limit_eval = 108000
+        elif self.env_type == "memory_maze":
+            # env_name: memory_maze-9x9 / 11x11 / 13x13 / 15x15
+            maze_size = int(env_name[1].split("x")[0])
+            assert env_name[1] == "{}x{}".format(maze_size, maze_size), "expected memory_maze-<n>x<n>, got {}".format("-".join(env_name))
+            self.config.env_class = envs.memory_maze.MemoryMazeEnv
+            self.config.env_params = {"maze_size": maze_size, "history_frames": 1, "img_size": (64, 64), "action_repeat": 1}
+            self.config.model_size = "MM"
+            # Fixed episode lengths: 1000 / 2000 / 3000 / 4000 agent steps
+            self.config.episode_length = envs.memory_maze.MemoryMazeEnv.EPISODE_LENGTHS[maze_size]
+            self.config.time_limit = self.config.episode_length
+            self.config.time_limit_eval = self.config.episode_length
         self.config.eval_env_params = {}
         self.config.train_env_params = {}
 
@@ -82,13 +122,14 @@ class TWISTER(models.Model):
         self.config.batch_size = 16
         self.config.L = 64
         self.config.H = 15
-        self.config.num_envs = {"dmc": 4, "atari100k": 1}[self.env_type]
-        self.config.epochs = {"dmc": 50, "atari100k": 50}[self.env_type]
-        self.config.epoch_length = {"dmc": 5000, "atari100k": 2000}[self.env_type]
-        self.config.env_step_period = {"dmc": 512, "atari100k": 1024}[self.env_type] # call env_step (batch_size * L) / (env_step_period * num_envs) times
+        self.config.num_envs = {"dmc": 4, "atari100k": 1, "memory_maze": 32}[self.env_type]
+        self.config.epochs = {"dmc": 50, "atari100k": 50, "memory_maze": 100}[self.env_type]
+        self.config.epoch_length = {"dmc": 5000, "atari100k": 2000, "memory_maze": None}[self.env_type] # memory_maze: None = derived from total_env_steps
+        self.config.env_step_period = {"dmc": 512, "atari100k": 1024, "memory_maze": 64}[self.env_type] # call env_step (batch_size * L) / (env_step_period * num_envs) times
+        self.config.total_env_steps = {"dmc": None, "atari100k": None, "memory_maze": int(100e6)}[self.env_type] # if epoch_length is None: epochs * epoch_length model steps = total_env_steps env steps
 
         # Eval
-        self.config.eval_episodes = {"dmc": 10, "atari100k": 100}[self.env_type]
+        self.config.eval_episodes = {"dmc": 10, "atari100k": 100, "memory_maze": 10}[self.env_type]
 
         # Optimizer
         self.config.opt_weight_decay = 0.0
@@ -102,7 +143,7 @@ class TWISTER(models.Model):
         self.config.critic_grad_max_norm = 100
         self.config.actor_grad_max_norm = 100
         self.config.grad_init_scale = 32.0
-        self.config.precision = {"dmc": torch.float16, "atari100k": torch.float32}[self.env_type]
+        self.config.precision = {"dmc": torch.float16, "atari100k": torch.float32, "memory_maze": torch.float16}[self.env_type]
 
         # Replay Buffer
         self.config.buffer_capacity = int(1e6)
@@ -138,7 +179,7 @@ class TWISTER(models.Model):
 
         # Actor Params
         self.config.actor_grad = "reinforce"
-        self.config.policy_discrete = {"dmc": False, "atari100k": True}[self.env_type]
+        self.config.policy_discrete = {"dmc": False, "atari100k": True, "memory_maze": True}[self.env_type]
         self.config.eta_entropy = 0.0003
         self.config.sampling_tmp = 1.0
 
@@ -159,6 +200,11 @@ class TWISTER(models.Model):
 
         # TSSM
         self.config.att_context_left = 8 # C must be <= L
+        self.config.att_query_chunk_size = None # observe attention computed by chunks of queries with checkpointing (e.g. 256 for L in the thousands), None = full attention
+        self.config.imag_shared_kv = True # share observe keys / values between imagination start points instead of copying a C window per start
+        self.config.imag_start_chunk_size = None # shared kv imagination attention computed by chunks of start points (bounds the (B, H, chunk, C) score tensors), None = all start points at once
+        self.config.imag_no_grad_reinforce = True # with actor_grad == "reinforce" no gradient flows through imagination: imagine without autograd graph
+        self.config.att_max_pos_encoding = None # relative position encoding table size, None = max(2048, L, C + 1)
         self.config.num_blocks_trans = model_params.num_blocks_trans
         self.config.ff_ratio_trans = model_params.ff_ratio_trans
         self.config.num_heads_trans = model_params.num_heads_trans
@@ -166,6 +212,7 @@ class TWISTER(models.Model):
         self.config.encoder_cnn_norm = {"class": "LayerNorm", "params": {"eps": 1e-3, "convert_float32": True}}
         self.config.module_pre_norm = False
         self.config.detach_decoder = False
+        self.config.cnn_checkpoint_chunk_size = None # encoder / decoder CNNs computed by chunks of frames with checkpointing (e.g. 1024), None = all frames at once
 
         # Contrastive
         self.config.contrastive_augments = torchvision.transforms.RandomResizedCrop(size=(64, 64), antialias=True, scale=(0.25, 1))
@@ -174,6 +221,13 @@ class TWISTER(models.Model):
         self.config.contrastive_steps = 10
         self.config.contrastive_exp_lambda = 0.75
         self.config.contrastive_layers = 2
+        self.config.contrastive_chunk_size = None # InfoNCE (B', B') similarity computed by chunks of rows with checkpointing (e.g. 4096), None = full matrix
+
+        # Training envs stepped in parallel subprocesses (ParallelBatchEnv) instead of sequentially in the training process
+        self.config.parallel_envs = {"dmc": False, "atari100k": False, "memory_maze": True}[self.env_type]
+
+        # Replay Buffer Mode
+        self.config.replay_buffer_mode = "window" # window: one window per env step (original), episode: complete episodes, windows start at episode starts (see EpisodeReplayBuffer)
 
         # Sample Pre Fill Steps
         self.config.random_pre_fill_steps = True
@@ -181,6 +235,20 @@ class TWISTER(models.Model):
         # Log Figure
         self.config.log_figure_batch = 16
         self.config.log_figure_context_frames = 5
+
+        # Memory Maze (TT-MBRL Table 17, with full episode context): every training sample is one complete episode
+        # (reset step + episode_length steps) and the attention context covers the whole episode
+        if self.env_type == "memory_maze":
+            self.config.batch_size = 4
+            self.config.L = self.config.episode_length + 1 # the reset step is stored in the replay buffer
+            self.config.att_context_left = self.config.L
+            self.config.replay_buffer_mode = "episode"
+            self.config.buffer_capacity = int(10e6)
+            self.config.log_figure_batch = 4
+            # Long sequences: observe attention / CNNs by chunks with checkpointing (same values and gradients)
+            if self.config.L >= 3000:
+                self.config.att_query_chunk_size = 256
+                self.config.cnn_checkpoint_chunk_size = 1024
 
         # Override Config
         for key, value in override_config.items():
@@ -193,16 +261,28 @@ class TWISTER(models.Model):
 
         # Config asserts
         assert self.config.att_context_left <= self.config.L
+        if self.config.epoch_length is None:
+            # Env steps per model step = batch_size * L / env_step_period
+            self.config.epoch_length = round(self.config.total_env_steps * self.config.env_step_period / (self.config.batch_size * self.config.L * self.config.epochs))
+        if self.config.att_max_pos_encoding is None:
+            self.config.att_max_pos_encoding = max(2048, self.config.L, self.config.att_context_left + 1)
+        assert self.config.att_max_pos_encoding >= max(self.config.L, self.config.att_context_left + 1), "att_max_pos_encoding must be >= max(L, C + 1)"
 
         # Create Training Envs
-        self.env = envs.wrappers.BatchEnv([
-            envs.wrappers.ResetOnException(
-                envs.wrappers.TimeLimit(
-                    self.config.env_class(**dict(self.config.env_params, **self.config.train_env_params)), 
-                    time_limit=self.config.time_limit_eval
+        if self.config.parallel_envs:
+            # One subprocess per env, stepped in parallel (same wrappers and outputs as BatchEnv)
+            self.env = envs.wrappers.ParallelBatchEnv([
+                functools.partial(envs.wrappers.make_env, self.config.env_class, dict(self.config.env_params, **self.config.train_env_params), time_limit=self.config.time_limit_eval)
+            for env_i in range(self.config.num_envs)])
+        else:
+            self.env = envs.wrappers.BatchEnv([
+                envs.wrappers.ResetOnException(
+                    envs.wrappers.TimeLimit(
+                        self.config.env_class(**dict(self.config.env_params, **self.config.train_env_params)), 
+                        time_limit=self.config.time_limit_eval
+                    )
                 )
-            )
-        for env_i in range(self.config.num_envs)])
+            for env_i in range(self.config.num_envs)])
                 
         # Create Evaluation Env
         if self.config.eval_episodes > 0:
@@ -223,12 +303,14 @@ class TWISTER(models.Model):
             cnn_norm=self.config.encoder_cnn_norm,
             stoch_size=self.config.model_stoch_size,
             discrete=self.config.model_discrete,
+            checkpoint_chunk_size=self.config.cnn_checkpoint_chunk_size,
         )
         self.decoder_network = twister_networks.DecoderNetwork(
             dim_output_cnn=self.config.image_channels, 
             feat_size=self.config.model_stoch_size * self.config.model_discrete, 
             dim_cnn=self.config.dim_cnn, 
             cnn_norm=self.config.norm,
+            checkpoint_chunk_size=self.config.cnn_checkpoint_chunk_size,
         )
         self.rssm = twister_networks.TSSM(
             num_actions=self.env.num_actions, 
@@ -242,7 +324,10 @@ class TWISTER(models.Model):
             num_heads=self.config.num_heads_trans,
             drop_rate=self.config.drop_rate_trans,
             att_context_left=self.config.att_context_left,
-            module_pre_norm=self.config.module_pre_norm
+            module_pre_norm=self.config.module_pre_norm,
+            att_query_chunk_size=self.config.att_query_chunk_size,
+            max_pos_encoding=self.config.att_max_pos_encoding,
+            imag_start_chunk_size=self.config.imag_start_chunk_size
         )
         self.policy_network = twister_networks.PolicyNetwork(
             num_actions=self.env.num_actions, 
@@ -293,6 +378,9 @@ class TWISTER(models.Model):
 
         # World Model
         self.world_model = self.WorldModel(outer=self)
+
+        # Fractional env steps carried to the next model steps (see num_env_steps_to_run)
+        self.env_step_balance = 0.0
 
         # Actor Model
         self.actor_model = self.ActorModel(outer=self)
@@ -448,9 +536,9 @@ class TWISTER(models.Model):
     def on_train_begin(self):
 
         # Pre Fill Buffer
-        if self.config.pre_fill_steps > 0 and self.replay_buffer.num_steps < self.config.pre_fill_steps:
+        if (self.config.pre_fill_steps > 0 and self.replay_buffer.num_steps < self.config.pre_fill_steps) or not self.replay_buffer.can_sample():
             print("Prefill dataset with {} steps, policy={}".format(self.config.pre_fill_steps, "random" if self.config.random_pre_fill_steps else "sample"))
-            while self.replay_buffer.num_steps < self.config.pre_fill_steps:
+            while self.replay_buffer.num_steps < self.config.pre_fill_steps or not self.replay_buffer.can_sample():
                 self.env_step()
 
     def compile(self):
@@ -760,16 +848,24 @@ class TWISTER(models.Model):
         num_env_steps = (self.config.batch_size * self.config.L) / (self.config.env_step_period * self.config.num_envs)
 
         # Env step every n model step
-        if 0 < num_env_steps < 1:
+        if 0 < num_env_steps < 1 and (1 / num_env_steps).is_integer():
             model_step_period = 1 / num_env_steps
             if self.model_step % model_step_period == 0:
                 with torch.cuda.amp.autocast(enabled=precision!=torch.float32, dtype=precision):
                     self.env_step()
             
         # n env steps per model step
-        else:
+        elif num_env_steps.is_integer():
             with torch.cuda.amp.autocast(enabled=precision!=torch.float32, dtype=precision):
                 for i in range(int(num_env_steps)):
+                    self.env_step()
+
+        # Fractional number of env steps per model step: carry the remainder to the next model steps,
+        # so that the replay ratio (batch_size * L) / (env steps) is exactly env_step_period on average
+        else:
+            n, self.env_step_balance = num_env_steps_to_run(self.env_step_balance, num_env_steps)
+            with torch.cuda.amp.autocast(enabled=precision!=torch.float32, dtype=precision):
+                for i in range(n):
                     self.env_step()
 
         # Update Infos
@@ -922,54 +1018,12 @@ class TWISTER(models.Model):
             # Flatten and Detach Posts
             ###############################################################################
 
-            # K, V: (B, C+L, D) -> (B*L, C, D)
-            hidden_flatten = [
-                (
-                    # Key (B*L, C, D)
-                    torch.stack([
-
-                        # Padd hidden if not enough left context (B, C, D)
-                        torch.cat([
-                            # Zero Padding to reach length (C,): max(0, L+C-1-t - len(h))
-                            hidden_blk[0].new_zeros(hidden_blk[0].shape[0], max(0, self.config.L+self.config.att_context_left-1-t - hidden_blk[0].shape[1]), hidden_blk[0].shape[2]), 
-                            # hidden [-L+t+1 - C:-L+t+1]
-                            hidden_blk[0][:, max(0, hidden_blk[0].shape[1]-self.config.L+t+1 - self.config.att_context_left):hidden_blk[0].shape[1]-self.config.L+t+1]
-                        ], dim=1) 
-
-                    for t in range(0, self.config.L)], dim=1).flatten(start_dim=0, end_dim=1).detach(), # (B, L, C, D) -> (B*L, C, D)
-
-                    # Value (B*L, C, D)
-                    torch.stack([
-
-                        # Padd hidden if not enough left context (B, C, D)
-                        torch.cat([
-                            # zeros max(0, L+C-1-t - len(h))
-                            hidden_blk[1].new_zeros(hidden_blk[1].shape[0], max(0, self.config.L+self.config.att_context_left-1-t - hidden_blk[1].shape[1]), hidden_blk[1].shape[2]), 
-                            # hidden [-L+t+1 - C:-L+t+1]
-                            hidden_blk[1][:, max(0, hidden_blk[1].shape[1]-self.config.L+t+1 - self.config.att_context_left):hidden_blk[1].shape[1]-self.config.L+t+1]
-                        ], dim=1) 
-
-                    for t in range(0, self.config.L)], dim=1).flatten(start_dim=0, end_dim=1).detach(), # (B, L, C, D) -> (B*L, C, D)
-                )
-            for hidden_blk in posts["hidden"]]
-
-            # is_firsts flatten (B, L) -> (B*L, 1), will result in masking hidden if true
-            self.outer.detached_is_firsts = is_firsts.flatten(start_dim=0, end_dim=1).unsqueeze(dim=1).detach()
-
-            # is_firsts hidden flatten (B, C+L) -> (B*L, C)
-            self.outer.detached_is_firsts_hidden = torch.stack([
-                torch.cat([
-                    # Zero Padding to reach length (C,): max(0, L+C-1-t - len(h))
-                    is_firsts_hidden_concat.new_zeros(is_firsts_hidden_concat.shape[0], max(0, self.config.L+self.config.att_context_left-1-t - is_firsts_hidden_concat.shape[1])),  
-                    # set first element to True in order to mask padding (1,)
-                    is_firsts_hidden_concat.new_ones(is_firsts_hidden_concat.shape[0], 1),
-                    # is_firsts [t-C + 1:t]
-                    is_firsts_hidden_concat[:, max(0, is_firsts_hidden_concat.shape[1]-self.config.L+t+1-self.config.att_context_left):is_firsts_hidden_concat.shape[1]-self.config.L+t]
-                ], dim=1) 
-            for t in range(0, self.config.L)], dim=1).flatten(start_dim=0, end_dim=1).detach()
-
-            # Flatten and detach post (B, L, D) -> (B*L, 1, D) = (B', 1, D)
-            self.outer.detached_posts = {k: hidden_flatten if k == "hidden" else v.flatten(start_dim=0, end_dim=1).unsqueeze(dim=1).detach() for k, v in posts.items()}
+            # (B, L, ...) -> (B*L, 1, ...) imagination start states, see TSSM.imagination_start
+            self.outer.detached_posts, self.outer.detached_is_firsts, self.outer.detached_is_firsts_hidden = self.rssm.imagination_start(
+                posts=posts, 
+                is_firsts=is_firsts_hidden_concat, 
+                shared_kv=self.config.imag_shared_kv
+            )
 
             return outputs
         
@@ -997,29 +1051,34 @@ class TWISTER(models.Model):
 
             prev_state = self.detached_posts
 
-            # Model Imagine H next states (B', 1+H, D) with state synchronized actions
-            img_states = self.rssm.imagine(
-                p_net=self.policy_network, 
-                prev_state=prev_state, 
-                img_steps=self.config.H,
-                is_firsts=self.detached_is_firsts,
-                is_firsts_hidden=self.detached_is_firsts_hidden
-            )
+            # With actor_grad == "reinforce", the actor loss only uses policy_network(feats.detach()) and detached advantages:
+            # no gradient flows through imagination, so the rollout does not need an autograd graph (same values, less memory)
+            imag_grad = not (self.config.actor_grad == "reinforce" and self.config.imag_no_grad_reinforce)
+            with torch.set_grad_enabled(imag_grad and torch.is_grad_enabled()):
 
-            # Get feat (B', 1+H, Dfeat)
-            feats = self.rssm.get_feat(img_states)
+                # Model Imagine H next states (B', 1+H, D) with state synchronized actions
+                img_states = self.rssm.imagine(
+                    p_net=self.policy_network, 
+                    prev_state=prev_state, 
+                    img_steps=self.config.H,
+                    is_firsts=self.detached_is_firsts,
+                    is_firsts_hidden=self.detached_is_firsts_hidden
+                )
 
-            # Predict rewards (B', 1+H, 1)
-            model_rewards = self.reward_network(feats)
+                # Get feat (B', 1+H, Dfeat)
+                feats = self.rssm.get_feat(img_states)
 
-            # Predict Values (B', 1+H, 1)
-            if self.config.target_value_reg:
-                values = self.value_network(feats)
-            else:
-                values = self.v_target(feats)
+                # Predict rewards (B', 1+H, 1)
+                model_rewards = self.reward_network(feats)
 
-            # Predict Discounts (B', 1+H, 1)
-            discounts = self.continue_network(feats).mode # 0 / 1
+                # Predict Values (B', 1+H, 1)
+                if self.config.target_value_reg:
+                    values = self.value_network(feats)
+                else:
+                    values = self.v_target(feats)
+
+                # Predict Discounts (B', 1+H, 1)
+                discounts = self.continue_network(feats).mode # 0 / 1
 
             # Override discount prediction for the first step with the true
             # discount factor from the replay buffer.
@@ -1164,26 +1223,8 @@ class TWISTER(models.Model):
     
     def compute_contrastive_loss(self, features_x, features_y):
 
-        # Flatten (B', D)
-        features_x = features_x.flatten(start_dim=0, end_dim=1)
-        features_y = features_y.flatten(start_dim=0, end_dim=1)
-
-        # Matmul (B', B')
-        features = features_x.matmul(features_y.transpose(0, 1))
-
-        # Diag (B',)
-        features_pos = torch.diag(features)
-
-        # Exp -> Sum -> Log: (B',)
-        features_all = torch.logsumexp(features, dim=-1)
-                        
-        # Info NCE Loss: (B',)
-        info_nce_loss = features_pos - features_all
-
-        # Accuracy Contrastive
-        acc_con = torch.mean(torch.where(features.argmax(dim=-1).cpu() == torch.arange(0, features.shape[0]), 1.0, 0.0))
-
-        return info_nce_loss, acc_con
+        # InfoNCE (B',) and accuracy, by chunks of rows with checkpointing if contrastive_chunk_size is set
+        return twister_chunked.info_nce_loss(features_x, features_y, chunk_size=self.config.contrastive_chunk_size)
 
     def play(self, verbose=False, return_att_w=False):
 

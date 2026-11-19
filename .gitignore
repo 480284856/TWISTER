@@ -7,3 +7,8 @@ callbacks/*
 .cache
 wandb/*
 env_twister/*
+.venv/
+
+*.out
+AAAtemplate_remote_interpreter/
+.claude/

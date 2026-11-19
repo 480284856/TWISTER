@@ -19,6 +19,7 @@ import torch.nn as nn
 # NeuralNets
 from nnet import modules
 from nnet import distributions
+from nnet.modules.twister.chunked import chunked_checkpoint
 
 class DecoderNetwork(nn.Module):
 
@@ -33,9 +34,13 @@ class DecoderNetwork(nn.Module):
         cnn_norm={"class": "LayerNorm", "params": {"eps": 1e-3}}, 
         dist_weight_init="xavier_uniform", 
         dist_bias_init="zeros",
-        image_size=(64, 64)
+        image_size=(64, 64),
+        checkpoint_chunk_size=None,
     ):
         super(DecoderNetwork, self).__init__()
+
+        # CNN computed by chunks of frames with activation checkpointing (None = all frames at once)
+        self.checkpoint_chunk_size = checkpoint_chunk_size
 
         self.feat_size = feat_size
         self.dim_output_cnn = dim_output_cnn
@@ -75,7 +80,7 @@ class DecoderNetwork(nn.Module):
         x = x.reshape((-1,) + self.dim_proj_out)
 
         # (B * N, C, 4, 4) -> (B * N, 3, 64, 64)
-        x = self.cnn(x)
+        x = chunked_checkpoint(self.cnn, x, self.checkpoint_chunk_size)
 
         # (B * N, 3, 64, 64) -> (B, N, 3, 64, 64)
         x = x.reshape(shape[:-1] + x.shape[1:])

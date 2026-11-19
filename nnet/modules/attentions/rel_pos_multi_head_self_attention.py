@@ -16,11 +16,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 # Neural Nets
 from nnet.modules import layers
 from nnet.modules import embeddings
 from nnet.modules.attentions import MultiHeadAttention
+from nnet.modules.attentions.shared_kv_cache import SharedKVCache
 from nnet import structs
 
 class RelPosMultiHeadSelfAttention(MultiHeadAttention):
@@ -50,7 +52,9 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
         bias_init="zeros", 
         output_proj=True,
         apply_bias=True,
-        channels_last=True
+        channels_last=True,
+        query_chunk_size=None,
+        query_chunk_checkpoint=True
     ):
         super(RelPosMultiHeadSelfAttention, self).__init__(
             dim_model=dim_model, 
@@ -76,6 +80,12 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
 
         # Relative Sinusoidal Positional Encodings
         self.rel_pos_enc = embeddings.RelSinPosEncoding(max_pos_encoding, self.dim_model, self.causal)
+
+        # Query chunking: compute attention for query_chunk_size queries at a time (causal + mask only).
+        # With query_chunk_checkpoint, each chunk is recomputed in backward (same dropout mask, RNG state preserved)
+        # so the (B, H, T, Th + T) attention scores / weights / dropout masks are never stored for backward.
+        self.query_chunk_size = query_chunk_size
+        self.query_chunk_checkpoint = query_chunk_checkpoint
 
     def rel_to_abs(self, att_scores):
 
@@ -164,6 +174,10 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
 
         """
 
+        # Shared KV cache imagination (mask is built from the cache)
+        if isinstance(hidden, SharedKVCache):
+            return self.forward_shared_kv(Q, K, V, cache=hidden, return_hidden=return_hidden, return_att_w=return_att_w)
+
         # Input Linear Layers
         Q, K, V = self.forward_inputs(Q, K, V)
 
@@ -201,24 +215,30 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
         # Reshape and Transpose (B, Th + 2*T-1, D) -> (B, H, Th + 2*T-1, d) / (B, Th + T, D) -> (B, H, Th + T, d)
         E = E.reshape(batch_size, -1, self.num_heads, self.dim_head).transpose(1, 2)
 
-        # att_scores (B, H, T, Th + T)
-        att_scores_K = Qu.matmul(K.transpose(2, 3))
-        att_scores_E = self.rel_to_abs(Qv.matmul(E.transpose(2, 3)))
-        att_scores = (att_scores_K + att_scores_E) / K.shape[-1]**0.5
+        # Query chunked attention (B, H, T, d), see forward_query_chunks
+        if self.use_query_chunks(Q.size(1), mask, return_att_w):
+            O = self.forward_query_chunks(Qu, Qv, K, V, E, mask)
 
-        # Apply mask
-        if mask is not None:
-            # (B, H, L, Context)
-            att_scores += (mask.logical_not() * -1e9)
+        else:
 
-        # Att weights (B, H, T, Th + T)
-        att_w = att_scores.softmax(dim=-1)
+            # att_scores (B, H, T, Th + T)
+            att_scores_K = Qu.matmul(K.transpose(2, 3))
+            att_scores_E = self.rel_to_abs(Qv.matmul(E.transpose(2, 3)))
+            att_scores = (att_scores_K + att_scores_E) / K.shape[-1]**0.5
 
-        # Att Dropout
-        att_w = self.dropout(att_w)
+            # Apply mask
+            if mask is not None:
+                # (B, H, L, Context)
+                att_scores += (mask.logical_not() * -1e9)
 
-        # Att output (B, H, T, d)
-        O = att_w.matmul(V)
+            # Att weights (B, H, T, Th + T)
+            att_w = att_scores.softmax(dim=-1)
+
+            # Att Dropout
+            att_w = self.dropout(att_w)
+
+            # Att output (B, H, T, d)
+            O = att_w.matmul(V)
 
         # Transpose and Reshape (B, H, T, d) -> (B, T, D)
         O = O.transpose(1, 2).reshape(batch_size, -1,  self.dim_model)
@@ -230,6 +250,227 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
         outputs = structs.AttrDict(x=O)
         if return_hidden:
             outputs.hidden = hidden
+        if return_att_w:
+            outputs.att_w = att_w
+
+        return outputs
+
+    def use_query_chunks(self, seq_len, mask, return_att_w):
+
+        # Causal with explicit mask only: masked positions hide the out of range relative positions
+        return self.query_chunk_size is not None and self.causal and mask is not None and not return_att_w and seq_len > self.query_chunk_size
+
+    def forward_query_chunks(self, Qu, Qv, K, V, E, mask):
+
+        """Causal relative position attention computed query_chunk_size queries at a time
+
+        Same function and gradients as the full computation in forwardQKV: every query row has its own softmax,
+        so splitting rows does not change the result. With query_chunk_checkpoint, the chunk internals
+        (scores, weights, dropout mask) are recomputed in backward with the preserved RNG state,
+        reproducing the dropout mask used in forward.
+
+        Args:
+            Qu, Qv: (B, H, T, d) queries with content / position bias
+            K, V: (B, H, Th + T, d)
+            E: (B, H, Th + T, d) relative position embeddings, row r = distance Th + T - 1 - r
+            mask: (1 or B, 1, T, Th + T)
+
+        Return:
+            O: (B, H, T, d)
+        """
+
+        T = Qu.size(2)
+
+        # Contiguous once, avoids a (B, H, Th + T, d) copy per chunk matmul
+        Qu, Qv, K, V, E = Qu.contiguous(), Qv.contiguous(), K.contiguous(), V.contiguous(), E.contiguous()
+
+        checkpoint = self.query_chunk_checkpoint and torch.is_grad_enabled()
+
+        O = []
+        for start in range(0, T, self.query_chunk_size):
+            end = min(T, start + self.query_chunk_size)
+            args = (Qu[:, :, start:end], Qv[:, :, start:end], K, V, E, mask[:, :, start:end], start, T)
+            if checkpoint:
+                O.append(torch.utils.checkpoint.checkpoint(self.attend_query_chunk, *args, use_reentrant=False, preserve_rng_state=True))
+            else:
+                O.append(self.attend_query_chunk(*args))
+
+        return torch.cat(O, dim=2)
+
+    def attend_query_chunk(self, Qu, Qv, K, V, E, mask, start, T):
+
+        """Attention for queries start .. start + c of a length T sequence (B, H, c, d)"""
+
+        B, H, c, d = Qu.shape
+        Tk = K.size(2)
+
+        # Content scores (B, H, c, Th + T)
+        att_scores_K = Qu.matmul(K.transpose(2, 3))
+
+        # Position scores: query i (key index Th + i) and key j, distance Th + i - j, E row (T - 1 - i) + j
+        # Equivalent to rel_to_abs on the full matrix; out of range (j > Th + i) entries are causally masked
+        i = torch.arange(start, start + c, device=Qu.device)
+        j = torch.arange(Tk, device=Qu.device)
+        rows = (j.unsqueeze(0) + (T - 1) - i.unsqueeze(1)).clamp(0, Tk - 1)
+        att_scores_E = Qv.matmul(E.transpose(2, 3)).gather(-1, rows.expand(B, H, c, Tk))
+
+        att_scores = (att_scores_K + att_scores_E) / d**0.5
+
+        # Apply mask (1 or B, 1, c, Th + T)
+        att_scores += (mask.logical_not() * -1e9)
+
+        # Att weights
+        att_w = att_scores.softmax(dim=-1)
+
+        # Att Dropout
+        att_w = self.dropout(att_w)
+
+        # Att output (B, H, c, d)
+        return att_w.matmul(V)
+
+    def attend_shared_kv_chunk(self, Qu, Qv, E, Kp, Vp, cache, a, b):
+
+        """Shared kv attention for start points a .. b-1
+
+        Args:
+            Qu, Qv: (B, H, L, d) queries of all start points
+            E: (C+1, H, d) relative position embeddings indexed by distance
+            Kp, Vp: imagined keys / values, lists of (B, H, L, d), oldest first, current token last
+            cache: SharedKVCache
+            a, b: start point range
+
+        Return:
+            O: (B, H, b-a, d)
+            att_w: (B, H, b-a, S + P) attention weights, S observe keys of the chunk band then P imagined keys
+        """
+
+        B, H, L, d = Qu.shape
+        C, h = cache.context, cache.step
+        Qu, Qv = Qu[:, :, a:b], Qv[:, :, a:b]
+        c = b - a
+
+        # Positional scores for every distance (B, H, c, C+1), einsum batches over heads (no expand of E over B)
+        P = torch.einsum("bhld,chd->bhlc", Qv, E)
+
+        ###############################################################################
+        # Observe (shared) keys: band s in [a+1-C+h, b-1], positions outside are masked anyway
+        ###############################################################################
+
+        k1 = b
+        k0 = min(max(0, a + 1 - C + h), k1)
+        Ks, Vs = cache.shared_k[:, :, k0:k1], cache.shared_v[:, :, k0:k1] # (B, H, S, d)
+        S = k1 - k0
+
+        # Query start t, key observe position s: distance t + 1 + h - s (c, S)
+        t_idx = torch.arange(a, b, device=Qu.device)
+        s_idx = torch.arange(k0, k1, device=Qu.device)
+        dist = t_idx.unsqueeze(1) + 1 + h - s_idx.unsqueeze(0)
+
+        # Content + position scores (B, H, c, S)
+        scores_s = Qu.matmul(Ks.transpose(2, 3)) + P.gather(-1, dist.clamp(0, C).expand(B, H, c, S))
+
+        # Band + episode mask: max(t+1-C+h, ep_start) <= s <= t  (B, 1, c, S)
+        lower = torch.maximum(t_idx + 1 - C + h, cache.ep_start[:, a:b]) # (B, c)
+        mask_s = (s_idx.view(1, 1, S) >= lower.unsqueeze(-1)) & (dist >= 1 + h).unsqueeze(0)
+        mask_s = mask_s.unsqueeze(1)
+
+        ###############################################################################
+        # Imagined (private) keys, one per start point
+        ###############################################################################
+
+        # Per key dot products avoid stacking (and saving) a new (B*L, P, D) tensor each step
+        n = len(Kp) - 1
+        scores_p = torch.stack([(Qu * k[:, :, a:b]).sum(dim=-1) + P[..., n - j] for j, k in enumerate(Kp)], dim=-1) # (B, H, c, P)
+
+        ###############################################################################
+        # Attention
+        ###############################################################################
+
+        # (B, H, c, S + P)
+        att_scores = torch.cat([scores_s, scores_p], dim=-1) / d**0.5
+        att_scores[..., :S] += (mask_s.logical_not() * -1e9)
+
+        # Att weights
+        att_w = att_scores.softmax(dim=-1)
+
+        # Att Dropout
+        att_w = self.dropout(att_w)
+
+        # Att output (B, H, c, d)
+        O = att_w[..., :S].matmul(Vs)
+        for j, v in enumerate(Vp):
+            O = O + att_w[..., S + j : S + j + 1] * v[:, :, a:b]
+
+        return O, att_w
+
+    def forward_shared_kv(self, Q, K, V, cache, return_hidden=False, return_att_w=False):
+
+        """Single step attention for B*L imagination rollouts sharing the observe keys / values
+
+        Numerically equivalent to forwardQKV with the per start point (B*L, C, D) hidden states
+        built by the original implementation, without materializing them.
+
+        Args:
+            Q, K, V: current imagined token of shape (B*L, 1, D)
+            cache: SharedKVCache with observe keys / values (B, L, D)
+
+        Return:
+            O: Attention output of shape (B*L, 1, D)
+            att_w: Attention weights of shape (B, H, L, S + P), observe keys band then imagined keys (start_chunk_size=None only)
+            hidden: SharedKVCache for the next step
+        """
+
+        assert self.causal, "shared kv cache requires causal attention"
+
+        # Input Linear Layers (B*L, 1, D)
+        Q, K, V = self.forward_inputs(Q, K, V)
+
+        # Sizes
+        B, L, C, h = cache.batch_size, cache.seq_len, cache.context, cache.step
+        H, d = self.num_heads, self.dim_head
+        assert cache.num_heads == H
+        assert Q.shape[0] == B * L and Q.shape[1] == 1, "expected ({}, 1, D) queries, got {}".format(B * L, tuple(Q.shape))
+        assert C < self.rel_pos_enc.max_len, "att context {} exceeds max_pos_encoding {}".format(C, self.rel_pos_enc.max_len)
+
+        # Add Bias
+        if self.apply_bias:
+            Qu = Q + self.u
+            Qv = Q + self.v
+        else:
+            Qu = Q
+            Qv = Q
+
+        # (B*L, 1, D) -> (B, H, L, d), start points t laid out along the query axis
+        to_heads = lambda x: x.reshape(B, L, H, d).transpose(1, 2)
+        Qu, Qv = to_heads(Qu), to_heads(Qv)
+
+        # Relative position embeddings indexed by distance E[dist], dist = 0..C (C+1, D)
+        R = self.rel_pos_enc.pos_encoding[0, self.rel_pos_enc.max_len - 1 - C : self.rel_pos_enc.max_len].flip(0)
+        E = self.pos_layer(R).reshape(C + 1, H, d) # (C+1, H, d)
+
+        # Imagined (private) keys / values, previous tokens (detached) + current token, distances n..0
+        Kp = [to_heads(k) for k in cache.private_k] + [to_heads(K)]
+        Vp = [to_heads(v) for v in cache.private_v] + [to_heads(V)]
+
+        # Attention by chunks of start points (B, H, L, d)
+        chunk = cache.start_chunk_size or L
+        assert not (return_att_w and chunk < L), "return_att_w requires start_chunk_size=None"
+        O, att_w = [], None
+        for a in range(0, L, chunk):
+            O_c, att_w = self.attend_shared_kv_chunk(Qu, Qv, E, Kp, Vp, cache, a, min(L, a + chunk))
+            O.append(O_c)
+        O = torch.cat(O, dim=2) if len(O) > 1 else O[0]
+
+        # (B, H, L, d) -> (B*L, 1, D)
+        O = O.transpose(1, 2).reshape(B * L, 1, self.dim_model)
+
+        # Output linear layer
+        O = self.forward_outputs(O)
+
+        # Format Outputs
+        outputs = structs.AttrDict(x=O)
+        if return_hidden:
+            outputs.hidden = cache.append(K, V)
         if return_att_w:
             outputs.att_w = att_w
 

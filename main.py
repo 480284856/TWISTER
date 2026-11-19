@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Solve dm_control bug
+# Solve dm_control bug: EGL headless rendering (Linux), GLFW on macOS (no EGL), unless MUJOCO_GL is already set
 import os
-os.environ["MUJOCO_GL"] = "egl"
+import sys
+os.environ.setdefault("MUJOCO_GL", "glfw" if sys.platform == "darwin" else "egl")
 
 # PyTorch
 import torch

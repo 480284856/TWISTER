@@ -29,7 +29,9 @@ else:
     callback_path = "callbacks/{}".format(env_name)
 
 # Replay Buffer
-training_dataset = nnet.datasets.ReplayBuffer(
+# window: original TWISTER buffer (one window per env step), episode: complete episodes, windows start at episode starts
+replay_buffer_class = {"window": nnet.datasets.ReplayBuffer, "episode": nnet.datasets.EpisodeReplayBuffer}[model.config.replay_buffer_mode]
+training_dataset = replay_buffer_class(
     batch_size=model.config.batch_size,
     root=callback_path,
     buffer_capacity=model.config.buffer_capacity,
