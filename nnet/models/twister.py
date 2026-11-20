@@ -84,7 +84,7 @@ class TWISTER(models.Model):
         # Env Type
         env_name = env_name.split("-")
         self.env_type = env_name[0]
-        assert self.env_type in ["dmc", "atari100k", "memory_maze"]
+        assert self.env_type in ["dmc", "atari100k", "memory_maze", "memory_maze_2d"]
 
         # Config
         self.config = AttrDict()
@@ -104,15 +104,15 @@ class TWISTER(models.Model):
             self.config.model_size = "S"
             self.config.time_limit = 108000
             self.config.time_limit_eval = 108000
-        elif self.env_type == "memory_maze":
-            # env_name: memory_maze-9x9 / 11x11 / 13x13 / 15x15
+        elif self.env_type in ["memory_maze", "memory_maze_2d"]:
+            # env_name: memory_maze-9x9 / 11x11 / 13x13 / 15x15 (3D), memory_maze_2d-<n>x<n> (grid world, 5 actions)
             maze_size = int(env_name[1].split("x")[0])
-            assert env_name[1] == "{}x{}".format(maze_size, maze_size), "expected memory_maze-<n>x<n>, got {}".format("-".join(env_name))
-            self.config.env_class = envs.memory_maze.MemoryMazeEnv
+            assert env_name[1] == "{}x{}".format(maze_size, maze_size), "expected {}-<n>x<n>, got {}".format(self.env_type, "-".join(env_name))
+            self.config.env_class = {"memory_maze": envs.memory_maze.MemoryMazeEnv, "memory_maze_2d": envs.memory_maze.MemoryMaze2dEnv}[self.env_type]
             self.config.env_params = {"maze_size": maze_size, "history_frames": 1, "img_size": (64, 64), "action_repeat": 1}
             self.config.model_size = "MM"
             # Fixed episode lengths: 1000 / 2000 / 3000 / 4000 agent steps
-            self.config.episode_length = envs.memory_maze.MemoryMazeEnv.EPISODE_LENGTHS[maze_size]
+            self.config.episode_length = self.config.env_class.EPISODE_LENGTHS[maze_size]
             self.config.time_limit = self.config.episode_length
             self.config.time_limit_eval = self.config.episode_length
         self.config.eval_env_params = {}
@@ -122,14 +122,14 @@ class TWISTER(models.Model):
         self.config.batch_size = 16
         self.config.L = 64
         self.config.H = 15
-        self.config.num_envs = {"dmc": 4, "atari100k": 1, "memory_maze": 32}[self.env_type]
-        self.config.epochs = {"dmc": 50, "atari100k": 50, "memory_maze": 100}[self.env_type]
-        self.config.epoch_length = {"dmc": 5000, "atari100k": 2000, "memory_maze": None}[self.env_type] # memory_maze: None = derived from total_env_steps
-        self.config.env_step_period = {"dmc": 512, "atari100k": 1024, "memory_maze": 64}[self.env_type] # call env_step (batch_size * L) / (env_step_period * num_envs) times
-        self.config.total_env_steps = {"dmc": None, "atari100k": None, "memory_maze": int(100e6)}[self.env_type] # if epoch_length is None: epochs * epoch_length model steps = total_env_steps env steps
+        self.config.num_envs = {"dmc": 4, "atari100k": 1, "memory_maze": 32, "memory_maze_2d": 32}[self.env_type]
+        self.config.epochs = {"dmc": 50, "atari100k": 50, "memory_maze": 100, "memory_maze_2d": 100}[self.env_type]
+        self.config.epoch_length = {"dmc": 5000, "atari100k": 2000, "memory_maze": None, "memory_maze_2d": None}[self.env_type] # memory_maze: None = derived from total_env_steps
+        self.config.env_step_period = {"dmc": 512, "atari100k": 1024, "memory_maze": 64, "memory_maze_2d": 64}[self.env_type] # call env_step (batch_size * L) / (env_step_period * num_envs) times
+        self.config.total_env_steps = {"dmc": None, "atari100k": None, "memory_maze": int(100e6), "memory_maze_2d": int(100e6)}[self.env_type] # if epoch_length is None: epochs * epoch_length model steps = total_env_steps env steps
 
         # Eval
-        self.config.eval_episodes = {"dmc": 10, "atari100k": 100, "memory_maze": 10}[self.env_type]
+        self.config.eval_episodes = {"dmc": 10, "atari100k": 100, "memory_maze": 10, "memory_maze_2d": 10}[self.env_type]
 
         # Optimizer
         self.config.opt_weight_decay = 0.0
@@ -143,7 +143,7 @@ class TWISTER(models.Model):
         self.config.critic_grad_max_norm = 100
         self.config.actor_grad_max_norm = 100
         self.config.grad_init_scale = 32.0
-        self.config.precision = {"dmc": torch.float16, "atari100k": torch.float32, "memory_maze": torch.float16}[self.env_type]
+        self.config.precision = {"dmc": torch.float16, "atari100k": torch.float32, "memory_maze": torch.float16, "memory_maze_2d": torch.float16}[self.env_type]
 
         # Replay Buffer
         self.config.buffer_capacity = int(1e6)
@@ -179,7 +179,7 @@ class TWISTER(models.Model):
 
         # Actor Params
         self.config.actor_grad = "reinforce"
-        self.config.policy_discrete = {"dmc": False, "atari100k": True, "memory_maze": True}[self.env_type]
+        self.config.policy_discrete = {"dmc": False, "atari100k": True, "memory_maze": True, "memory_maze_2d": True}[self.env_type]
         self.config.eta_entropy = 0.0003
         self.config.sampling_tmp = 1.0
 
@@ -224,7 +224,7 @@ class TWISTER(models.Model):
         self.config.contrastive_chunk_size = None # InfoNCE (B', B') similarity computed by chunks of rows with checkpointing (e.g. 4096), None = full matrix
 
         # Training envs stepped in parallel subprocesses (ParallelBatchEnv) instead of sequentially in the training process
-        self.config.parallel_envs = {"dmc": False, "atari100k": False, "memory_maze": True}[self.env_type]
+        self.config.parallel_envs = {"dmc": False, "atari100k": False, "memory_maze": True, "memory_maze_2d": True}[self.env_type]
 
         # Replay Buffer Mode
         self.config.replay_buffer_mode = "window" # window: one window per env step (original), episode: complete episodes, windows start at episode starts (see EpisodeReplayBuffer)
@@ -238,7 +238,7 @@ class TWISTER(models.Model):
 
         # Memory Maze (TT-MBRL Table 17, with full episode context): every training sample is one complete episode
         # (reset step + episode_length steps) and the attention context covers the whole episode
-        if self.env_type == "memory_maze":
+        if self.env_type in ["memory_maze", "memory_maze_2d"]:
             self.config.batch_size = 4
             self.config.L = self.config.episode_length + 1 # the reset step is stored in the replay buffer
             self.config.att_context_left = self.config.L

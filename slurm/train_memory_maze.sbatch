@@ -21,7 +21,7 @@
 #
 #SBATCH --job-name=twister-mm
 #SBATCH --partition=standard
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:l40:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=160G
 #SBATCH --time=1-00:00:00

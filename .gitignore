@@ -12,3 +12,4 @@ env_twister/*
 *.out
 AAAtemplate_remote_interpreter/
 .claude/
+logs/
