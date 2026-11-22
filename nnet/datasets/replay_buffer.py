@@ -49,7 +49,7 @@ class ReplayBuffer(datasets.Dataset):
         self.ram_buffer = collections.OrderedDict()
         self.streams = collections.OrderedDict()
         self.traj_index = torch.tensor(0)
-        self.num_steps = torch.tensor(0)
+        self.num_steps = torch.tensor(0)                          # Number of samples(steps or frames) in the buffer or Number of overlap trajectories in the buffer
         self.last_save_traj_index = 0
         self.buffer_dir = os.path.join(root, self.buffer_name)
         self.save_trajectories = save_trajectories

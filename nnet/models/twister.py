@@ -506,15 +506,20 @@ class TWISTER(models.Model):
         obs_reset = self.env.reset()
         self.episode_history = AttrDict(
             ep_step=torch.zeros(self.config.num_envs), # (N,)
-            hidden=(self.rssm.initial(batch_size=self.config.num_envs, seq_length=1, dtype=torch.float32, detach_learned=True), torch.zeros(self.config.num_envs, self.env.num_actions, dtype=torch.float32)), 
+            hidden=(self.rssm.initial(
+                        batch_size=self.config.num_envs, 
+                        seq_length=1, dtype=torch.float32, detach_learned=True
+                    ), 
+                    torch.zeros(self.config.num_envs, self.env.num_actions, dtype=torch.float32)
+            ), 
             state=obs_reset.state,
             episodes=[AttrDict(
-                states=[obs_reset.state[env_i]],
-                actions=[torch.zeros(self.env.num_actions, dtype=torch.float32)],
+                states=[obs_reset.state[env_i]],                                   # the first frame of an episode
+                actions=[torch.zeros(self.env.num_actions, dtype=torch.float32)],  # a placeholder, the first action is the second element. It's a one-hot vector for Memory Maze
                 rewards=[obs_reset.reward[env_i]],
                 dones=[obs_reset.done[env_i]],
-                is_firsts=[obs_reset.is_first[env_i]],
-                model_steps=[self.model_step.clone()]
+                is_firsts=[obs_reset.is_first[env_i]],                             # whether the frame is the first frame of an episode.
+                model_steps=[self.model_step.clone()]                              # up to the time the frame is sampled from environment, how many times the world model has been updated
             ) for env_i in range(self.config.num_envs)]
         )
 
@@ -536,6 +541,8 @@ class TWISTER(models.Model):
     def on_train_begin(self):
 
         # Pre Fill Buffer
+        #                                                                                                    # there is at least one trajectory in the buffer to sample from
+        #    there are at least `pre_fill_steps` frames in the buffer to sample from
         if (self.config.pre_fill_steps > 0 and self.replay_buffer.num_steps < self.config.pre_fill_steps) or not self.replay_buffer.can_sample():
             print("Prefill dataset with {} steps, policy={}".format(self.config.pre_fill_steps, "random" if self.config.random_pre_fill_steps else "sample"))
             while self.replay_buffer.num_steps < self.config.pre_fill_steps or not self.replay_buffer.can_sample():
@@ -599,8 +606,21 @@ class TWISTER(models.Model):
         ###############################################################################
 
         # Recover State / hidden
-        state = self.episode_history.state
-        hidden = self.episode_history.hidden
+        state = self.episode_history.state    # current state(z_t)
+        hidden = self.episode_history.hidden  # previous history and action
+        # hidden: assume currrent time step is t
+        # Look at the second column of Figure 3(a) of TWISTER
+        # We receive observation o_t that will be encoded into z_t.
+
+        #{
+        #   prev_latent: {
+        #       logits: original output from encoder at time step t-1, a function of o_t-1.
+        #       stoch: stochastic state sampled from logits at time step t-1, z_t-1
+        #       deter: deterministic state from RSSM at time step t-1(h_t-1, at the first column of Figure 3(a), a function of "z_0, a_0, z_1, ..., a_t-2", used to predict z_t-1)
+        #       hidden: KV cache for transformer's input that are z_0+a_0, z_1+a_1, ..., z_t-2+a_t-2, from beginning to the first column of Figure 3(a)
+        # }
+        #   action: a_t-1, action vector taken at time step t-1
+        #}
 
         # Unpack hidden
         prev_latent, action = hidden
@@ -613,13 +633,13 @@ class TWISTER(models.Model):
         # Forward Policy Network
         with torch.no_grad():
 
-            # Repr State (B, ...)
+            # Repr State z_t (B, ...)
             latent = self.encoder_network(self.preprocess_inputs(state, time_stacked=False))
 
             # Unsqueeze Time dim (B, 1, ...)
             latent = {key: value.unsqueeze(dim=1) for key, value in latent.items()}
 
-            # Generate is_firsts_hidden for forward
+            # Generate is_firsts_hidden for for  ward
             if prev_latent["hidden"] != None:
                 is_firsts_hidden = torch.zeros(self.config.num_envs, self.rssm.get_hidden_len(prev_latent["hidden"]), dtype=torch.float32, device=action.device)
                 for env_i in range(self.config.num_envs):
@@ -630,6 +650,9 @@ class TWISTER(models.Model):
                 is_firsts_hidden = None
 
             # RSSM (B, 1, ...)
+            # latent: h_t,
+            #         KV cache from beginning to t-1(the second column of Figure 3(a) of TWISTER)
+            #         z_t, 
             latent, _ = self.rssm(
                 states=latent, 
                 prev_states=prev_latent, 
@@ -639,9 +662,13 @@ class TWISTER(models.Model):
             )
 
             # Get feat (B, Dfeat)
+            # h_t,z_t --concat--> s_t
+            # Look at the second column of Figure 3(a) of TWISTER
             feat = self.rssm.get_feat(latent).squeeze(dim=1)
 
             # Policy Sample
+            # 1. logits: [B, A], continuous
+            # 2. sample: [B, A], softmax(dim=-1), one-hot vector, discrete
             action = self.policy_network(feat).sample().cpu()
 
         # Update Hidden
@@ -649,12 +676,14 @@ class TWISTER(models.Model):
         hidden = (latent, action)
 
         # Clip Action
+        # Only for continuous action space, Memory Maze is discrete, so it won't go into this branch.
         if not self.config.policy_discrete:
             action = action.type(torch.float32).clip(self.env.clip_low, self.env.clip_high)
 
         # Env Step
         if (self.replay_buffer.num_steps < self.config.pre_fill_steps) and self.config.random_pre_fill_steps:
             action = self.env.sample()
+        # action.argmax(dim=-1): self.env might be a parallel env
         obs = self.env.step(action.argmax(dim=-1) if self.config.policy_discrete else action)
 
         ###############################################################################
@@ -662,6 +691,7 @@ class TWISTER(models.Model):
         ###############################################################################
 
         # Update training_infos
+        # How many env steps have been taken in total
         self.action_step += self.env.action_repeat * self.config.num_envs
         self.ep_rewards += obs.reward.to(self.ep_rewards.device)
 
@@ -729,6 +759,10 @@ class TWISTER(models.Model):
                 for key in self.episode_history.hidden[0]:
 
                     # Do not reset hidden
+                    # We've already sliced the KV cache before `latent["hidden"] = self.rssm.slice_hidden(latent["hidden"])`
+                    # so we don't reset again here. 
+                    # The KV cache is a gian tensor that contains all KV cache across different envs,
+                    # if we reset it, we break the tensor.
                     if key != "hidden":
                         self.episode_history.hidden[0][key][env_i] = latent[key].squeeze(dim=0)
 

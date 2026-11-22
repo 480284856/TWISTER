@@ -85,15 +85,20 @@ class EpisodeReplayBuffer(datasets.ReplayBuffer):
     def enforce_capacity(self):
 
         # Pop oldest episodes while stored steps > capacity
+        # self.buffer_capacity: maximum number of environment steps (stored frames in Memory Maze) in the buffer
         while self.num_steps > self.buffer_capacity and len(self.ram_buffer) > 0:
             oldest_episode_id, oldest_episode = self.ram_buffer.popitem(last=False)
             self.num_steps -= self.episode_length(oldest_episode)
+            # sample_ids: a list of episode ids that can be sampled
             if self.sample_ids and self.sample_ids[0] == oldest_episode_id:
                 self.sample_ids.pop(0)
 
     def finalize_episode(self, stream):
-
-        # Stack elements (elt, T, ...)
+        # Stack elements (elt(element), T, ...)
+        # Imagine there is a table where each row is a sample, 
+        # and each sample has several elements: observation, reward, action, etc. 
+        # Each column has the name: observations, rewards, actions, etc.
+        # Now, here we organize these samples by column, so episodes will have as many tensors as there are columns.
         episode = [torch.stack([step[elt] for step in stream], dim=0) for elt in range(len(stream[0]))]
         length = self.episode_length(episode)
 
@@ -106,7 +111,7 @@ class EpisodeReplayBuffer(datasets.ReplayBuffer):
             self.num_short_episodes += 1
 
         # Update Index
-        self.traj_index += 1
+        self.traj_index += 1      # It keeps going up, even if some episodes are evicted from the buffer, so it can be used as a unique identifier for each episode.
         self.num_steps += length
 
         # Enforce num_steps <= buffer_capacity
@@ -127,6 +132,9 @@ class EpisodeReplayBuffer(datasets.ReplayBuffer):
         is_first = bool(sample[self.IS_FIRST_INDEX])
         if is_first and len(stream) > 0:
             self.finalize_episode(stream)
+            # This writing makes `stream` and `self.stream` with `sample_id` access the same list object. 
+            # When we use `stream` to append an element in line 143 in the code below, 
+            # we can also access the element via `self.stream` with `sample_id`.
             stream = self.streams[sample_id] = []
 
         # Steps before the first reset of a stream (not episode aligned) are dropped

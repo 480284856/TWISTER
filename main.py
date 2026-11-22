@@ -42,12 +42,15 @@ def main(args):
     print("Mode: {}".format(args.mode))
 
     # Load Config
+    # Load the objects defined in a .py file.
     args.config = importlib.import_module(args.config_file.replace(".py", "").replace("/", "."))
 
     # Load Model
     model = functions.load_model(args)
 
     # Load Dataset
+    # dataset_train: replay buffer, inserting trajectories while training
+    # dataset_eval: fake dataloader, outputs fixed number of episodes (nnet.models.twister.__init__:self.config.eval_episodes)
     dataset_train, dataset_eval = functions.load_datasets(args)
 
     ###############################################################################
@@ -59,24 +62,34 @@ def main(args):
 
         model.fit(
             dataset_train=dataset_train, 
-            epochs=getattr(args.config, "epochs", 1000), 
+            epochs=getattr(args.config, "epochs", 1000),                                                            # nnet.models.twister.__init__:self.config.epochs
             dataset_eval=dataset_eval, 
-            initial_epoch=int(args.checkpoint.split("_")[2]) if args.checkpoint != None else 0, 
+            initial_epoch=int(args.checkpoint.split("_")[2]) if args.checkpoint != None else 0,                     # checkpoints_epoch_48_step_19182.ckpt
             callback_path=args.config.callback_path,
-            precision=getattr(args.config, "precision", torch.float32),
-            accumulated_steps=getattr(args.config, "accumulated_steps", 1),
-            eval_period_step=getattr(args.config, "eval_period_step", args.eval_period_step),
-            eval_period_epoch=getattr(args.config, "eval_period_epoch", args.eval_period_epoch),
-            saving_period_epoch=getattr(args.config, "saving_period_epoch", args.saving_period_epoch),
-            log_figure_period_step=getattr(args.config, "log_figure_period_step", args.log_figure_period_step),
-            log_figure_period_epoch=getattr(args.config, "log_figure_period_epoch", args.log_figure_period_epoch),
-            step_log_period=args.step_log_period,
-            grad_init_scale=getattr(args.config, "grad_init_scale", 65536.0),
-            detect_anomaly=getattr(args.config, "detect_anomaly", args.detect_anomaly),
-            recompute_metrics=getattr(args.config, "recompute_metrics", False),
+            precision=getattr(args.config, "precision", torch.float32),                                             # nnet.models.twister.__init__:self.config.epochs
+            accumulated_steps=getattr(args.config, "accumulated_steps", 1),                                         # gradient accumulation
+            eval_period_step=getattr(args.config, "eval_period_step", args.eval_period_step),                       # how many steps of parameter updates between evaluations, default: None (defined by `eval_period_step` at the end of this file)
+                                                                                                                    # Related call stacks:
+                                                                                                                    #   main.py
+                                                                                                                    #   └─ model.fit(...)
+                                                                                                                    #      └─ model.py → Model.fit()              进入训练循环
+                                                                                                                    #         ├─ twister.py → TWISTER.train_step()  每个训练批次
+                                                                                                                    #         │  ├─ model.py → Model.train_step()  世界模型
+                                                                                                                    #         │  ├─ model.py → Model.train_step()  Actor
+                                                                                                                    #         │  └─ model.py → Model.train_step()  Critic
+                                                                                                                    #         └─ model.py → Model.on_step_end()   梯度累积完成后，检查是否触发评估
+
+            eval_period_epoch=getattr(args.config, "eval_period_epoch", args.eval_period_epoch),                    # how many epochs between evaluations, default: 5 (defined by `eval_period_epoch` at the end of this file)
+            saving_period_epoch=getattr(args.config, "saving_period_epoch", args.saving_period_epoch),              # how many epochs between model saving, default: 1 (defined by `saving_period_epoch` at the end of this file)
+            log_figure_period_step=getattr(args.config, "log_figure_period_step", args.log_figure_period_step),     # how many steps of parameter updates between figure(TT-MBRL Fig 26) logging, default: None (defined by `log_figure_period_step` at the end of this file)
+            log_figure_period_epoch=getattr(args.config, "log_figure_period_epoch", args.log_figure_period_epoch),  # log figure after every n epochs, default: 1 (defined by `log_figure_period_epoch` at the end of this file)
+            step_log_period=args.step_log_period,                                                                   # log metrics(like loss, reward, etc.) after every n steps, default: 100 (defined by `step_log_period` at the end of this file)
+            grad_init_scale=getattr(args.config, "grad_init_scale", 65536.0),                                       # multiply the initial gradient by this factor, and after backpropagation, divide the gradient by this factor after the optimizer step
+            detect_anomaly=getattr(args.config, "detect_anomaly", args.detect_anomaly),                             # locate the problematic operation in the backward pass(only in debug mode).
+            recompute_metrics=getattr(args.config, "recompute_metrics", False),                                     # not relevant to this project
             wandb_logging=args.wandb,
             verbose_progress_bar=args.verbose_progress_bar,
-            keep_last_k=args.keep_last_k
+            keep_last_k=args.keep_last_k                                                                            # keep the last k checkpoints, default: 3 (defined by `keep_last_k` at the end of this file)
         )
 
     # Evaluation

@@ -30,6 +30,7 @@ else:
 
 # Replay Buffer
 # window: original TWISTER buffer (one window per env step), episode: complete episodes, windows start at episode starts
+# model.config.replay_buffer_mode: see nnet/models/twister.py:230
 replay_buffer_class = {"window": nnet.datasets.ReplayBuffer, "episode": nnet.datasets.EpisodeReplayBuffer}[model.config.replay_buffer_mode]
 training_dataset = replay_buffer_class(
     batch_size=model.config.batch_size,

@@ -660,6 +660,7 @@ class Model(modules.Module):
         torch.set_anomaly_enabled(detect_anomaly)
 
         # Init Training
+        # gradient accumulation step counter
         acc_step = 0
 
         # Zero Gradients
@@ -683,6 +684,7 @@ class Model(modules.Module):
         try:
 
             # On Train Begin
+            # Warmup for replay buffer
             self.on_train_begin()
 
             # Training Loop
@@ -851,6 +853,13 @@ class Model(modules.Module):
             targets = self.transfer_to_device(targets)
 
             # Eval Step
+            # batch_losses: {}
+            # batch_metrics: {
+            #     "score": xx, # undiscounted return in a trajectory
+            #     "steps": xx, # number of steps in a trajectory
+            # }
+            # batch_truths: {}
+            # batch_preds: {}
             batch_losses, batch_metrics, batch_truths, batch_preds = self.eval_step(inputs, targets, verbose)
 
             # Update Epoch Dict

@@ -340,6 +340,9 @@ class TSSM(nn.Module):
         if modules.is_shared_kv_hidden(hidden):
             return hidden
 
+        # hidden[i]: the KV cache for the i-th transformer block
+        # hidden[i][0]: the K cache for the i-th transformer block, shape (B, L, D)
+        # hidden[i][1]: the V cache for the i-th transformer block, shape (B, L, D)
         hidden = [(hidden_blk[0][:, -self.att_context_left:], hidden_blk[1][:, -self.att_context_left:]) for hidden_blk in hidden]
 
         return hidden
@@ -354,25 +357,46 @@ class TSSM(nn.Module):
             return 0
 
     def forward_img(self, prev_states, prev_actions, mask, return_att_w=False, return_blocks_deter=False):
+        '''
+        Assume we are at time step t.
+        
+        Look at the second column of Figure 3(a) of TWISTER
+        We receive observation o_t that will be encoded into z_t.
+
+        {
+           prev_states: {
+               logits: original output from encoder at time step t-1, a function of o_t-1.
+               stoch: stochastic state sampled from logits at time step t-1, z_t-1
+               deter: deterministic state from RSSM at time step t-1(h_t-1, at the first column of Figure 3(a), a function of "z_0, a_0, z_1, ..., a_t-2", used to predict z_t-1)
+               hidden: KV cache for transformer's input that are z_0+a_0, z_1+a_1, ..., z_t-2+a_t-2, from beginning to the first column of Figure 3(a)
+         }
+           prev_actions: a_t-1, action vector taken at time step t-1
+        }
+        '''
 
         # Clip Action -c:+c
         if self.action_clip > 0.0:
             prev_actions = prev_actions * (self.action_clip / torch.clip(torch.abs(prev_actions), min=self.action_clip)).detach()
 
         # Flatten stoch size and discrete size
+        # convert 2D grid of one-hot vector into 1D vector
         if self.discrete:
             stoch = prev_states["stoch"].flatten(start_dim=-2, end_dim=-1)
         else:
             stoch = prev_states["stoch"]
 
         # MLP Img 1
+        # final input to transformer
+        # for time step t, the input is [z_t-1, a_t-1] where z_t is the stochastic state 
         x = self.action_mixer(torch.concat([stoch, prev_actions], dim=-1))
 
         # Recurrent
         assert self.get_hidden_len(prev_states["hidden"]) <= self.att_context_left, "warning: att context left is {} and hidden has length {}".format(self.att_context_left, self.get_hidden_len(prev_states["hidden"]))
         outputs = self.transformer(x, hidden=prev_states["hidden"], mask=mask, return_hidden=True, return_att_w=return_att_w, return_blocks_x=return_blocks_deter)
         deter, hidden = outputs.x, outputs.hidden
-
+        # deter: output of transformer at time step t, h_t, a function of "z_0, a_0, z_1, ..., a_t-1", [B, 1, D]
+        # hidden: KV cache for transformer's input that are z_0+a_0, z_1+a_1, ..., z_t-1+a_t-1, from beginning to the second column of Figure 3(a)
+        
         # Additional Outputs
         add_out_dict = {}
         if return_att_w:
@@ -381,10 +405,12 @@ class TSSM(nn.Module):
             add_out_dict["blocks_deter"] = outputs.blocks_x
 
         # Linear Logits
+        # h_t -> p_t, used to sample ^z_t, the predicted stochastic state at time step t, [B, 1, 32, 32]
         logits = self.dynamics_predictor(deter).reshape(deter.shape[:-1] + (self.stoch_size, self.discrete))
         dist_params = {'logits': logits}
     
         # Sample
+        # h_t -> p_t -> ^z_t
         stoch = self.get_dist(dist_params).rsample()
 
         # Return Prior
