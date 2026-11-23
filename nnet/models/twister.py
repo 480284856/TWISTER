@@ -649,10 +649,8 @@ class TWISTER(models.Model):
             else:
                 is_firsts_hidden = None
 
-            # RSSM (B, 1, ...)
-            # latent: h_t,
-            #         KV cache from beginning to t-1(the second column of Figure 3(a) of TWISTER)
-            #         z_t, 
+            # RSSM posterior at timestep t (B, 1, ...): encoder logits from o_t,
+            # stoch (sampled z_t), deter (Transformer output h_t), and hidden (updated KV cache).
             latent, _ = self.rssm(
                 states=latent, 
                 prev_states=prev_latent, 
@@ -666,13 +664,16 @@ class TWISTER(models.Model):
             # Look at the second column of Figure 3(a) of TWISTER
             feat = self.rssm.get_feat(latent).squeeze(dim=1)
 
-            # Policy Sample
+            # Sample action based on s_t.
             # 1. logits: [B, A], continuous
             # 2. sample: [B, A], softmax(dim=-1), one-hot vector, discrete
             action = self.policy_network(feat).sample().cpu()
 
         # Update Hidden
         latent["hidden"] = self.rssm.slice_hidden(latent["hidden"])
+        # Save timestep t's encoder logits, sampled z_t, Transformer output h_t,
+        # updated KV cache, and sampled action a_t for the next env_step().
+        # At timestep t+1, z_t and a_t form the next Transformer input.
         hidden = (latent, action)
 
         # Clip Action
