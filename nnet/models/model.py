@@ -693,6 +693,15 @@ class Model(modules.Module):
                 # Init Iterator
                 print("Epoch {}/{}:".format(epoch + 1, epochs))
                 epoch_iterator = tqdm(dataset_train, total=steps_per_epoch * accumulated_steps if steps_per_epoch else None, dynamic_ncols=True, disable=verbose_progress_bar==0)
+                # data structure:
+                # batch = {
+                #     "inputs": [states, actions, rewards, dones, is_firsts, model_steps],
+                #     "targets": [],
+                # }
+                # states: [B, L, C, H, W]
+                
+                # ReplayBuffer.__getitem__ -> ReplayBuffer.collate_fn -> utils.CollateFn
+                #        - EpisodeReplayBuffer.sample
 
                 # Init Epoch Dict
                 epoch_losses = {}

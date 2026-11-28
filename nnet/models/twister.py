@@ -648,7 +648,11 @@ class TWISTER(models.Model):
                         is_firsts_hidden[env_i, -env_i_length] = 1.0
             else:
                 is_firsts_hidden = None
-
+            
+            # RSSM (B, 1, ...)
+            # latent: h_t,
+            #         KV cache from beginning to t-1(the second column of Figure 3(a) of TWISTER)
+            #         z_t,
             # RSSM posterior at timestep t (B, 1, ...): encoder logits from o_t,
             # stoch (sampled z_t), deter (Transformer output h_t), and hidden (updated KV cache).
             latent, _ = self.rssm(
@@ -920,6 +924,7 @@ class TWISTER(models.Model):
 
         def __init__(self, outer):
             super().__init__(name="World Model")
+            # reference to the outer class to access its attributes and methods
             object.__setattr__(self, "outer", outer)
             self.encoder_network = self.outer.encoder_network
             self.decoder_network = self.outer.decoder_network
@@ -933,7 +938,9 @@ class TWISTER(models.Model):
 
         def forward(self, inputs):
 
-            # Unpack Inputs 
+            # Memory Maze shapes (B: batch size, L: sequence length, A: number of actions).
+            # states: [B, L, 3, 64, 64]; actions: [B, L, A].
+            # rewards, dones, is_firsts, and model_steps: [B, L].
             states, actions, rewards, dones, is_firsts, model_steps = inputs
 
             # Outputs
@@ -958,18 +965,39 @@ class TWISTER(models.Model):
             )
 
             # Update Hidden States
+            #           0                             1                                 0
+            # frame at previous episode   frame 0 at the current episode | frame 1 at the current episode
+            # attention mask will mask out the previous episode's frame, 
+            # so that the current episode's frames will not attend to the previous episode's frames.
             is_firsts_hidden_concat = is_firsts
 
             # Get feat (B, L, Dfeat)
+            # concatenate posts['stoch'].flatten(-2, -1) and posts['deter'] along the last dimension 
+            # to get the feature representation
             feats = self.rssm.get_feat(posts)
 
-            # Predict reward (B, L, 1)
+            # Predict reward (B, L, 255)
             model_rewards = self.reward_network(feats)
 
             # Rec Images (B, L, ...)
-            states_pred = self.decoder_network(posts["stoch"].flatten(-2, -1).detach() if self.config.detach_decoder else posts["stoch"].flatten(-2, -1))
+            # self.config.detach_decoder: Stop gradient from backpropagating to the encoder 
+            # to make the encoder focuses on extracting useful information for world modeling.
+            # Specifically, just like a human, in order to decrease image reconstruction loss, 
+            # the encoder might have to spend part of its parameters(part of his brain power) to learn 
+            # how to minimize image reconstruction error, 
+            # but image reconstruction isn't used during inference, so it can't learn how to extract useful
+            # information for world modeling.
+            states_pred = self.decoder_network(
+                posts["stoch"].flatten(-2, -1).detach() if self.config.detach_decoder else posts["stoch"].flatten(-2, -1)
+            )
 
             # Predict Discounts
+            # [B, L, 1]
+            # predict whether current step is terminal or not.
+            # in imagination(training of policy network), computation is in parallel,
+            # different imagined trajectories might ends at different time steps,
+            # so When a trajectory ends, in order to make sure other imagination trajectories keep going, we continue to compute.
+            # When every image trajectory is finished, we use this to emit the subsequent predicted reward after terminal time step.
             discount_pred = self.continue_network(feats)
 
             ###############################################################################
@@ -980,9 +1008,14 @@ class TWISTER(models.Model):
             states_flatten = states.flatten(0, 1)
 
             # Augment
-            states_aug = torch.stack([self.config.contrastive_augments(states_flatten[b]) for b in range(states_flatten.shape[0])], dim=0).reshape(states.shape)
-
-            # Forward
+            # 把目标图像 做随机裁剪，对于裁剪出来的区域 放大到原尺寸
+            states_aug = torch.stack(
+                [   # torchvision.transforms.RandomResizedCrop(size=(64, 64), antialias=True, scale=(0.25, 1))
+                    self.config.contrastive_augments(states_flatten[b]) 
+                        for b in range(states_flatten.shape[0])
+                ], dim=0
+            ).reshape(states.shape)
+            # Forward for Augment
             posts_con = self.encoder_network(states_aug)
 
             # Contrastive steps loop
@@ -990,11 +1023,16 @@ class TWISTER(models.Model):
 
                 # Action condition (B, L-t, A*t)
                 if t > 0:
-                    actions_cond = torch.cat([actions[:, 1+t_:min(actions.shape[1], actions.shape[1]+1+t_-t)] for t_ in range(t)], dim=-1)
+                    actions_cond = torch.cat([
+                        actions[:, 1+t_:min(actions.shape[1], actions.shape[1]+1+t_-t)] for t_ in range(t)], 
+                        dim=-1
+                    )
 
                 # Contrastive features (B, L-t, D)
                 features_feats, features_embed = self.contrastive_network[t](
-                    feats=self.rssm.get_feat(priors) if t==0 else torch.cat([self.rssm.get_feat(priors)[:, :-t], actions_cond], dim=-1), 
+                    feats=self.rssm.get_feat(priors) if t==0 else torch.cat([
+                          self.rssm.get_feat(priors)[:, :-t], actions_cond
+                    ], dim=-1), 
                     embed=posts_con["stoch"].flatten(-2, -1) if t==0 else posts_con["stoch"].flatten(-2, -1)[:, t:]
                 )
                     
@@ -1021,33 +1059,60 @@ class TWISTER(models.Model):
             ###############################################################################
 
             # Model Image Loss
-            self.add_loss("model_image", - states_pred.log_prob(states.detach()).mean(), weight=self.config.loss_decoder_scale)
+            self.add_loss(
+                "model_image", 
+                - states_pred.log_prob(states.detach()).mean(), 
+                weight=self.config.loss_decoder_scale
+            )
 
             ###############################################################################
             # Model kl Loss
             ###############################################################################
 
             # KL
-            kl_prior = torch.distributions.kl.kl_divergence(self.rssm.get_dist({k: v if k == "hidden" else v.detach() for k, v in posts.items()}), self.rssm.get_dist(priors))
-            kl_post = torch.distributions.kl.kl_divergence(self.rssm.get_dist(posts), self.rssm.get_dist({k: v if k == "hidden" else v.detach() for k, v in priors.items()}))
+            kl_prior = torch.distributions.kl.kl_divergence(
+                self.rssm.get_dist({k: v if k == "hidden" else v.detach() for k, v in posts.items()}), 
+                self.rssm.get_dist(priors)
+            )
+            kl_post = torch.distributions.kl.kl_divergence(
+                self.rssm.get_dist(posts), 
+                self.rssm.get_dist({k: v if k == "hidden" else v.detach() for k, v in priors.items()})
+            )
 
             # Add losses, Mean after Free Nats
-            self.add_loss("kl_prior", torch.mean(torch.clip(kl_prior, min=self.config.free_nats)), weight=self.config.loss_kl_prior_scale)
-            self.add_loss("kl_post", torch.mean(torch.clip(kl_post, min=self.config.free_nats)), weight=self.config.loss_kl_post_scale)
+            # FrameNet: if the pair loss of a frame is smaller than one, we stop the gradient from it.
+            self.add_loss(
+                "kl_prior", 
+                torch.mean(torch.clip(kl_prior, min=self.config.free_nats)), 
+                weight=self.config.loss_kl_prior_scale
+            )
+            self.add_loss(
+                "kl_post", 
+                torch.mean(torch.clip(kl_post, min=self.config.free_nats)), 
+                weight=self.config.loss_kl_post_scale
+            )
 
             ###############################################################################
             # Model Reward Loss
             ###############################################################################
 
             # Model Reward Loss
-            self.add_loss("model_reward", - model_rewards.log_prob(rewards.unsqueeze(dim=-1).detach()).mean(), weight=self.config.loss_reward_scale)
+            self.add_loss(
+                "model_reward", 
+                - model_rewards.log_prob(rewards.unsqueeze(dim=-1).detach()).mean(), 
+                weight=self.config.loss_reward_scale
+            )
 
             ###############################################################################
             # Model Discount Loss
             ###############################################################################
 
             # Model Discount Loss
-            self.add_loss("model_discount", - discount_pred.log_prob((1.0 - dones).unsqueeze(dim=-1).detach()).mean(), self.config.loss_discount_scale)
+            self.add_loss(
+                "model_discount", 
+                - discount_pred.log_prob((1.0 - dones).unsqueeze(dim=-1).detach()).mean(), 
+                weight=self.config.loss_discount_scale
+            )
 
             ###############################################################################
             # Flatten and Detach Posts
@@ -1148,6 +1213,12 @@ class TWISTER(models.Model):
             if self.config.actor_grad == "dynamics":
                 actor_loss = advantage
             elif self.config.actor_grad == "reinforce":
+                # img_states["action"] is one-hot vector
+                # the code below equals to:
+                # action = img_states["action"].detach()       # [0, 1, 0] left, right, forward
+                # probs = policy_dist.probs                    # [0.2, 0.7, 0.1]
+                # chosen_prob = (action * probs).sum(dim=-1)   # [0, 0.7, 0] → 0.7
+                # log_prob = chosen_prob.log()                 # log(0.7)
                 actor_loss = policy_dist.log_prob(img_states["action"].detach())[:, :-1] * advantage.detach()
             else:
                 raise Exception("Unknown actor grad: {}".format(self.actor_grad))

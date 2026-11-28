@@ -20,6 +20,23 @@ import torch.nn as nn
 from nnet.modules import layers
 from nnet import structs
 
+def fp32_scores(device):
+
+    """Context for computing attention scores in float32
+
+    Under float16 autocast, Q.matmul(K^T) overflows to inf once a dot product exceeds 65504
+    (before the 1/sqrt(d) scaling), and the -1e9 mask also becomes -inf; inf + -inf = NaN then
+    propagates through the softmax. Same function as before, only without the overflow.
+    """
+
+    return torch.autocast(device_type=device.type, enabled=False)
+
+def to_fp32(x):
+
+    """Upcast float16 / bfloat16 to float32, other dtypes (float32, float64) unchanged"""
+
+    return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+
 class MultiHeadAttention(nn.Module):
 
     """Mutli-Head Attention Layer
@@ -135,21 +152,22 @@ class MultiHeadAttention(nn.Module):
         K = K.reshape(batch_size, -1, self.num_heads, self.dim_head).transpose(1, 2)
         V = V.reshape(batch_size, -1, self.num_heads, self.dim_head).transpose(1, 2)
 
-        # Att scores (B, H, T, T)
-        att_scores = Q.matmul(K.transpose(2, 3)) / K.shape[-1]**0.5
+        # Att scores and weights (B, H, T, T), float32 (see fp32_scores)
+        with fp32_scores(Q.device):
+            att_scores = to_fp32(Q).matmul(to_fp32(K).transpose(2, 3)) / K.shape[-1]**0.5
 
-        # Apply mask
-        if mask is not None:
-            att_scores += (mask.logical_not() * -1e9)
+            # Apply mask
+            if mask is not None:
+                att_scores += (mask.logical_not() * -1e9)
 
-        # Att weights (B, H, T, T)
-        att_w = att_scores.softmax(dim=-1)
+            # Att weights (B, H, T, T)
+            att_w = att_scores.softmax(dim=-1)
 
         # Att Dropout
         att_w = self.dropout(att_w)
 
         # Att output (B, H, T, d)
-        O = att_w.matmul(V)
+        O = att_w.to(V.dtype).matmul(V)
 
         # Transpose and Reshape (B, H, T, d) -> (B, T, D)
         O = O.transpose(1, 2).reshape(batch_size, -1,  self.dim_model)

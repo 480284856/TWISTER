@@ -22,6 +22,7 @@ import torch.utils.checkpoint
 from nnet.modules import layers
 from nnet.modules import embeddings
 from nnet.modules.attentions import MultiHeadAttention
+from nnet.modules.attentions.multi_head_attention import fp32_scores, to_fp32
 from nnet.modules.attentions.shared_kv_cache import SharedKVCache
 from nnet import structs
 
@@ -221,24 +222,25 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
 
         else:
 
-            # att_scores (B, H, T, Th + T)
-            att_scores_K = Qu.matmul(K.transpose(2, 3))
-            att_scores_E = self.rel_to_abs(Qv.matmul(E.transpose(2, 3)))
-            att_scores = (att_scores_K + att_scores_E) / K.shape[-1]**0.5
+            # att_scores and weights (B, H, T, Th + T), float32 (see fp32_scores)
+            with fp32_scores(Qu.device):
+                att_scores_K = to_fp32(Qu).matmul(to_fp32(K).transpose(2, 3))
+                att_scores_E = self.rel_to_abs(to_fp32(Qv).matmul(to_fp32(E).transpose(2, 3)))
+                att_scores = (att_scores_K + att_scores_E) / K.shape[-1]**0.5
 
-            # Apply mask
-            if mask is not None:
-                # (B, H, L, Context)
-                att_scores += (mask.logical_not() * -1e9)
+                # Apply mask
+                if mask is not None:
+                    # (B, H, L, Context)
+                    att_scores += (mask.logical_not() * -1e9)
 
-            # Att weights (B, H, T, Th + T)
-            att_w = att_scores.softmax(dim=-1)
+                # Att weights (B, H, T, Th + T)
+                att_w = att_scores.softmax(dim=-1)
 
             # Att Dropout
             att_w = self.dropout(att_w)
 
             # Att output (B, H, T, d)
-            O = att_w.matmul(V)
+            O = att_w.to(V.dtype).matmul(V)
 
         # Transpose and Reshape (B, H, T, d) -> (B, T, D)
         O = O.transpose(1, 2).reshape(batch_size, -1,  self.dim_model)
@@ -304,29 +306,34 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
         B, H, c, d = Qu.shape
         Tk = K.size(2)
 
-        # Content scores (B, H, c, Th + T)
-        att_scores_K = Qu.matmul(K.transpose(2, 3))
-
         # Position scores: query i (key index Th + i) and key j, distance Th + i - j, E row (T - 1 - i) + j
         # Equivalent to rel_to_abs on the full matrix; out of range (j > Th + i) entries are causally masked
         i = torch.arange(start, start + c, device=Qu.device)
         j = torch.arange(Tk, device=Qu.device)
         rows = (j.unsqueeze(0) + (T - 1) - i.unsqueeze(1)).clamp(0, Tk - 1)
-        att_scores_E = Qv.matmul(E.transpose(2, 3)).gather(-1, rows.expand(B, H, c, Tk))
 
-        att_scores = (att_scores_K + att_scores_E) / d**0.5
+        # Scores and weights in float32 (see fp32_scores)
+        with fp32_scores(Qu.device):
 
-        # Apply mask (1 or B, 1, c, Th + T)
-        att_scores += (mask.logical_not() * -1e9)
+            # Content scores (B, H, c, Th + T)
+            att_scores_K = to_fp32(Qu).matmul(to_fp32(K).transpose(2, 3))
 
-        # Att weights
-        att_w = att_scores.softmax(dim=-1)
+            # Position scores (B, H, c, Th + T)
+            att_scores_E = to_fp32(Qv).matmul(to_fp32(E).transpose(2, 3)).gather(-1, rows.expand(B, H, c, Tk))
+
+            att_scores = (att_scores_K + att_scores_E) / d**0.5
+
+            # Apply mask (1 or B, 1, c, Th + T)
+            att_scores += (mask.logical_not() * -1e9)
+
+            # Att weights
+            att_w = att_scores.softmax(dim=-1)
 
         # Att Dropout
         att_w = self.dropout(att_w)
 
         # Att output (B, H, c, d)
-        return att_w.matmul(V)
+        return att_w.to(V.dtype).matmul(V)
 
     def attend_shared_kv_chunk(self, Qu, Qv, E, Kp, Vp, cache, a, b):
 
@@ -346,8 +353,29 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
 
         B, H, L, d = Qu.shape
         C, h = cache.context, cache.step
-        Qu, Qv = Qu[:, :, a:b], Qv[:, :, a:b]
         c = b - a
+
+        # Scores and weights in float32 (see fp32_scores), values stay in the autocast dtype
+        with fp32_scores(Qu.device):
+            att_w, S = self.shared_kv_chunk_weights(to_fp32(Qu[:, :, a:b]), to_fp32(Qv[:, :, a:b]), to_fp32(E), Kp, cache, a, b)
+
+        # Att Dropout
+        att_w = self.dropout(att_w)
+
+        # Att output (B, H, c, d)
+        Vs = cache.shared_v[:, :, b - S:b]
+        O = att_w[..., :S].to(Vs.dtype).matmul(Vs)
+        for j, v in enumerate(Vp):
+            O = O + att_w[..., S + j : S + j + 1] * v[:, :, a:b]
+
+        return O, att_w
+
+    def shared_kv_chunk_weights(self, Qu, Qv, E, Kp, cache, a, b):
+
+        """Attention weights of attend_shared_kv_chunk (B, H, c, S + P) and the number S of observe keys"""
+
+        B, H, c, d = Qu.shape
+        C, h = cache.context, cache.step
 
         # Positional scores for every distance (B, H, c, C+1), einsum batches over heads (no expand of E over B)
         P = torch.einsum("bhld,chd->bhlc", Qv, E)
@@ -358,7 +386,7 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
 
         k1 = b
         k0 = min(max(0, a + 1 - C + h), k1)
-        Ks, Vs = cache.shared_k[:, :, k0:k1], cache.shared_v[:, :, k0:k1] # (B, H, S, d)
+        Ks = to_fp32(cache.shared_k[:, :, k0:k1]) # (B, H, S, d)
         S = k1 - k0
 
         # Query start t, key observe position s: distance t + 1 + h - s (c, S)
@@ -380,7 +408,7 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
 
         # Per key dot products avoid stacking (and saving) a new (B*L, P, D) tensor each step
         n = len(Kp) - 1
-        scores_p = torch.stack([(Qu * k[:, :, a:b]).sum(dim=-1) + P[..., n - j] for j, k in enumerate(Kp)], dim=-1) # (B, H, c, P)
+        scores_p = torch.stack([(Qu * to_fp32(k[:, :, a:b])).sum(dim=-1) + P[..., n - j] for j, k in enumerate(Kp)], dim=-1) # (B, H, c, P)
 
         ###############################################################################
         # Attention
@@ -393,15 +421,7 @@ class RelPosMultiHeadSelfAttention(MultiHeadAttention):
         # Att weights
         att_w = att_scores.softmax(dim=-1)
 
-        # Att Dropout
-        att_w = self.dropout(att_w)
-
-        # Att output (B, H, c, d)
-        O = att_w[..., :S].matmul(Vs)
-        for j, v in enumerate(Vp):
-            O = O + att_w[..., S + j : S + j + 1] * v[:, :, a:b]
-
-        return O, att_w
+        return att_w, S
 
     def forward_shared_kv(self, Q, K, V, cache, return_hidden=False, return_att_w=False):
 

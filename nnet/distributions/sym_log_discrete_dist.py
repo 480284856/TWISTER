@@ -64,6 +64,7 @@ class SymLogDiscreteDist:
         target = (F.one_hot(below, num_classes=len(self.bins)) * weight_below.unsqueeze(dim=-1) + F.one_hot(above, len(self.bins)) * weight_above.unsqueeze(dim=-1))
 
         # Normalize == log(softmax(.))
+        # log p = log(e^logits / sum(e^logits)) = logits - log(sum(e^logits))
         log_pred = self.logits - torch.logsumexp(self.logits, dim=-1, keepdims=True)
         
         target = target.squeeze(dim=-2)
